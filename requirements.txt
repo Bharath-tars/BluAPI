@@ -1,0 +1,17 @@
+fastapi
+fastapi-cors 
+gunicorn
+httpx
+python-dotenv
+uvicorn
+python-multipart
+numpy
+requests
+openpyxl
+pandas
+azure-cognitiveservices-vision-computervision
+msrest
+pydantic
+passlib
+python-jose
+uuid
