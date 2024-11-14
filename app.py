@@ -178,14 +178,17 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
         - Ensure that "Vendor" and "Buyer" details are not confused. Vendor is the seller, typically mentioned first, and is associated with "GSTIN" or "PAN".
         - Avoid confusing cumulative quantities with rates. Quantities are usually numeric values with units like "CUM", "KG", or "L". Rates are monetary values with currency symbols like "₹" or "$".
         - If any fields are not found, return "None" as the value.
+        **Please provide only the JSON content, without any code block markers, explanations, or extra text. Start directly with open brackets and end with closed brackets, formatted as plain JSON.**
         """
         response_content = await get_openai_response(prompt, model_name)
         print(response_content)
         print(len(response_content))
+        
         if not response_content:
             continue
         try:
-            invoice_data = json.loads(response_content)
+            cleaned_response = re.sub(r'```json\n|\n```', '', response_content)
+            invoice_data = json.loads(cleaned_response)
         except json.JSONDecodeError:
             print("Error: Could not parse the response as JSON.")
             print("Response:", response_content)
