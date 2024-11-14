@@ -21,14 +21,12 @@ from datetime import date
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel
 from passlib.context import CryptContext
 import secrets
 import time
 from tempfile import TemporaryDirectory
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
-from pydantic import BaseModel
 import uuid_utils as uuid
 
 app = FastAPI()
