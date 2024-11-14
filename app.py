@@ -29,7 +29,7 @@ from tempfile import TemporaryDirectory
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from pydantic import BaseModel
-import uuid
+import uuid_utils as uuid
 
 app = FastAPI()
 
