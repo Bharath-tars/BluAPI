@@ -14,4 +14,4 @@ msrest
 pydantic
 passlib
 python-jose
-uuid
+uuid-utils
