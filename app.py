@@ -50,10 +50,10 @@ computervision_client = ComputerVisionClient(endpoint, CognitiveServicesCredenti
 
 
 AVAILABLE_MODELS = {
-    'gpt-4': 'gpt-4',
+    'gpt4': 'gpt-4',
     'gpt3': 'gpt-3.5-turbo'
 }
-DEFAULT_MODEL = 'gpt3'
+DEFAULT_MODEL = 'gpt4'
 
 start_time_ai = 0
 start_time_ocr = 0
