@@ -19,15 +19,19 @@ import smtplib
 from email.message import EmailMessage
 from datetime import date
 from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.responses import RedirectResponse
+from passlib.context import CryptContext
+import secrets
 import time
-import uuid
-import firebase_admin
-from firebase_admin import credentials
-from firebase_admin import db
+from tempfile import TemporaryDirectory
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+import uuid_utils as uuid
 import re
 
-
 app = FastAPI()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,24 +47,23 @@ subscription_key = os.environ.get("AZURE_SUBSCRIPTION_KEY")
 endpoint = "https://my-ocr-image.cognitiveservices.azure.com/"
 computervision_client = ComputerVisionClient(endpoint, CognitiveServicesCredentials(subscription_key))
 
-cred = credentials.Certificate('bluorigin-859f2-firebase-adminsdk-5jn3f-9711c648d8.json')
-firebase_admin.initialize_app(cred, {
-    'databaseURL': 'https://bluorigin-859f2-default-rtdb.asia-southeast1.firebasedatabase.app/'
-})
-
 
 
 AVAILABLE_MODELS = {
-    'gpt-4': 'gpt-4',
-    'gpt-3.5': 'gpt-3.5-turbo'
+    'gpt4': 'gpt-4',
+    'gpt3': 'gpt-3.5-turbo'
 }
-DEFAULT_MODEL = 'gpt-3.5'
+DEFAULT_MODEL = 'gpt4'
 
 start_time_ai = 0
 start_time_ocr = 0
 end_time_ai = 0
 end_time_ocr = 0
 
+processed_data = []  # Store processed data to be retrieved by GET request
+processing_complete = False  # Flag to indicate when processing is complete
+
+request_data_store = {}
 
 logs = {}
 ai_money = 0
@@ -72,12 +75,7 @@ def ocr_cost(calls):
 
 async def calculate_cost(input_tokens, output_tokens):
     global ai_money
-    if logs["model_name"] == "gpt-4":
-        ai_money += input_tokens * 0.002532 + output_tokens * 0.005064
-    elif logs["model_name"] == "gpt-3.5":
-        ai_money += input_tokens * 0.00012672 + output_tokens * 0.00025344
-    else:
-        ai_money += input_tokens * 0.0012 + output_tokens * 0.0024
+    ai_money += input_tokens * 0.002532 + output_tokens * 0.005064
 
 async def delay_between_requests():
     delay = random.uniform(1, 5)
@@ -121,7 +119,6 @@ async def get_openai_response(prompt, model_name=DEFAULT_MODEL, retries=3):
                     print(f"Error during API request: {e}")
                     raise
         print("Failed to get response after multiple attempts. Returning None.")
-        return None
 
 def sno():
     with open('variable', 'r') as lt:
@@ -139,9 +136,12 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
     if model_name not in AVAILABLE_MODELS:
         print(f"Error: Model '{model_name}' is not available. Using default model '{DEFAULT_MODEL}' instead.")
         model_name = DEFAULT_MODEL
-    print("About to process")
+    responses = []
+    no_of_invoices = len(invoice_texts)
+    print("Abou to process")
+    cost_ocr = ocr_cost(no_of_invoices)
+    logs["ocr_cost"] = cost_ocr 
     all_ids = []
-    responses= []
     for ocr_output in invoice_texts:
         # Print OCR text for debugging purposes
         print(len(ocr_output))        
@@ -179,13 +179,12 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
         - Ensure that "Vendor" and "Buyer" details are not confused. Vendor is the seller, typically mentioned first, and is associated with "GSTIN" or "PAN".
         - Avoid confusing cumulative quantities with rates. Quantities are usually numeric values with units like "CUM", "KG", or "L". Rates are monetary values with currency symbols like "₹" or "$".
         - If any fields are not found, return "None" as the value.
-
         **Please provide only the JSON content, without any code block markers, explanations, or extra text. Start directly with open brackets and end with closed brackets, formatted as plain JSON.**
         """
         response_content = await get_openai_response(prompt, model_name)
         print(response_content)
         print(len(response_content))
-        responses.append(response_content)
+        
         if not response_content:
             continue
         try:
@@ -204,19 +203,19 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
         invoice_id  = sno()
         all_ids.append(invoice_id)
         summary_data = {
-            "Output_ID": invoice_id,
-            "Invoice_Number": invoice_data.get("invoice_number", "not found"),
-            "Invoice_Date": invoice_data.get("invoice_date", "not found"),
-            "Vendor_Name": invoice_data.get("vendor_name", "not found"),
-            "Vendor_Address": invoice_data.get("vendor_address", "not found"),
-            "Vendor_GST": invoice_data.get("vendor_gst", "not found"),
-            "Vendor_PAN": invoice_data.get("vendor_pan", "not found"),
-            "Buyer_GST": invoice_data.get("buyer_gst", "not found"),
-            "Shipping_Address": invoice_data.get("shipping_address", "not found"),
-            "Site_or_Project_Name": invoice_data.get("site_name", "not found"),
-            "Total_Amount": invoice_data.get("total_amount", "not found"),
-            "Other_Charges": invoice_data.get("other_charges", "not found"),
-            "Other_Charges_Amount": invoice_data.get("other_charges_amount", "not found")
+            "Output ID": invoice_id,
+            "Invoice Number": invoice_data.get("invoice_number", "not found"),
+            "Invoice Date": invoice_data.get("invoice_date", "not found"),
+            "Vendor Name": invoice_data.get("vendor_name", "not found"),
+            "Vendor Address": invoice_data.get("vendor_address", "not found"),
+            "Vendor GST": invoice_data.get("vendor_gst", "not found"),
+            "Vendor PAN": invoice_data.get("vendor_pan", "not found"),
+            "Buyer GST": invoice_data.get("buyer_gst", "not found"),
+            "Shipping Address": invoice_data.get("shipping_address", "not found"),
+            "Site/Project Name": invoice_data.get("site_name", "not found"),
+            "Total Amount": invoice_data.get("total_amount", "not found"),
+            "Other Charges": invoice_data.get("other_charges", "not found"),
+            "Other Charges Amount": invoice_data.get("other_charges_amount", "not found")
         }
 
         # Handle tax details if available
@@ -224,25 +223,24 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
         if isinstance(tax_details, list):
             for i, tax in enumerate(tax_details):
                 if isinstance(tax, dict):
-                    summary_data[f"Tax_Type_{i+1}"] = tax.get("tax_type", "not found")
-                    summary_data[f"Tax_Rate_{i+1}"] = tax.get("rate", "not found")
-                    summary_data[f"Tax_Amount_{i+1}"] = tax.get("amount", "not found")
+                    summary_data[f"Tax Type {i+1}"] = tax.get("tax_type", "not found")
+                    summary_data[f"Tax Rate {i+1} (%)"] = tax.get("rate", "not found")
+                    summary_data[f"Tax Amount {i+1}"] = tax.get("amount", "not found")
 
         # Handle line items if available
         line_items = invoice_data.get("line_items", [])
         if isinstance(line_items, list):
             for i, item in enumerate(line_items, start=1):
                 if isinstance(item, dict):
-                    summary_data[f"Description_{i}"] = item.get("description", "not found")
-                    summary_data[f"HSN_or_SAC_Code_{i}"] = item.get("hsn_sac_code", "not found")
-                    summary_data[f"Quantity_{i}"] = item.get("quantity", "not found")
-                    summary_data[f"Cumulative_Quantity_{i}"] = item.get("cumulative_quantity", "not found")
-                    summary_data[f"Rate_{i}"] = item.get("rate", "not found")
-                    summary_data[f"Amount_{i}"] = item.get("amount", "not found")
+                    summary_data[f"Description {i}"] = item.get("description", "not found")
+                    summary_data[f"HSN/SAC Code {i}"] = item.get("hsn_sac_code", "not found")
+                    summary_data[f"Quantity {i}"] = item.get("quantity", "not found")
+                    summary_data[f"Cumulative Quantity {i}"] = item.get("cumulative_quantity", "not found")
+                    summary_data[f"Rate {i}"] = item.get("rate", "not found")
+                    summary_data[f"Amount {i}"] = item.get("amount", "not found")
 
         all_data.append(summary_data)
     logs["invoice_output_ids"] = all_ids
-    logs["openai_outputs"] = responses
     return pd.DataFrame(all_data)
 
 # Function to extract text from image using Azure OCR
@@ -283,8 +281,10 @@ async def extract_text_from_image(image_path, retries=3):
 @app.post("/process_invoices")
 async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), model_name: str = DEFAULT_MODEL):
     global processing_complete
+    logs["time stamp"] = date.today().strftime("%Y-%m-%d")
     request_id = str(uuid.uuid4())
-    processing_complete = False  
+    request_data_store[request_id] = {"status": "processing", "data": None}
+    processing_complete = False  # Reset the flag at the start of processing
     file_paths = []
 
 
@@ -297,19 +297,11 @@ async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), mo
     try:
         print("Ocr start")
         ocr_start_time = time.time()
-
         ocr_outputs = await asyncio.gather(*[process_image(file_path) for file_path in file_paths])
-
         ocr_end_time = time.time()
-        logs["time_stamp"] = date.today().strftime("%Y-%m-%d")
-        logs["invoice_count"] = len(ocr_outputs)
-        logs["model_name"] = model_name
         total_ocr_time = ocr_end_time - ocr_start_time
         logs["ocr_time"] = total_ocr_time
-        logs["ocr_cost"] = ocr_cost(len(ocr_outputs))
-        logs["ocr_outputs"] = ocr_outputs
         print("Ocr Done")
-    
 
         ai_start_time = time.time()
         print("inside")
@@ -318,44 +310,39 @@ async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), mo
         ai_end_time = time.time()
         total_ai_time = ai_end_time - ai_start_time
         logs["ai_time"] = total_ai_time
-        logs["ai_cost"] = ai_money
 
         logs["total_time"] = total_ocr_time + total_ai_time
+
+        logs["ai_cost"] = ai_money
         logs["total_cost"] = logs["ocr_cost"] + logs["ai_cost"]
+        logs["time stamp"] = date.today().strftime("%Y-%m-%d")
+
+        print(logs)
         print("Invoice data extracted successfully.")
         print(results)
-
-        invoice_data_dict = results.replace({np.nan: "NULL"}).to_dict(orient='records')
+        invoice_data_dict = results.replace({np.nan: None}).to_dict(orient='records')
+        processed_data.extend(invoice_data_dict)  # Store processed data for GET request
         processing_complete = True  # Set the flag when processing is complete
-        logs["invoices_result"] = invoice_data_dict
-        refa = db.reference('output_data/' + request_id)
+        request_data_store[request_id]["status"] = "completed"
+        request_data_store[request_id]["data"] = invoice_data_dict
+        df = pd.DataFrame([logs])
+        file_path = "logs_output.xlsx"
 
-        refa.set({
-                "time_stamp": logs["time_stamp"],
-                "result": invoice_data_dict,
-        })
-        return JSONResponse(content={"request_id": request_id, "invoice_data": invoice_data_dict}) 
-       
+        if os.path.exists(file_path):
+            with pd.ExcelWriter(file_path, engine="openpyxl", mode="a", if_sheet_exists="overlay") as writer:
+                df.to_excel(writer, index=False, header=False, startrow=writer.sheets["Sheet1"].max_row)
+        else:
+            df.to_excel(file_path, index=False)
+        print(f"Data saved to {file_path}")
+
+        return JSONResponse(content={"request_id": request_id, "invoice_data": invoice_data_dict})    
     except Exception as e:
+        request_data_store[request_id]["status"] = "error"
+        request_data_store[request_id]["error"] = str(e)
         return HTTPException(status_code=500, detail=str(e))
-    
     finally:
         for path in file_paths:
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                print(f"File not found: {path}")
-            except Exception as e:
-                print(f"Error while removing file {path}: {str(e)}")
-
-        output_id = request_id
-        ref = db.reference('logs/' + output_id)
-        ref.set({
-                "time_stamp": logs["time_stamp"],
-                "output_id": output_id,
-                "content" : logs
-        })
-        print("Data Pushed to Firebase")
+            os.remove(path)
 
 async def process_image(file_path: str):
     start_time = time.time()
@@ -363,51 +350,31 @@ async def process_image(file_path: str):
     print(f"OCR extraction took {time.time() - start_time:.2f} seconds")
     return ocr_text
 
+@app.get("/get_processed_invoices")
+async def get_processed_invoices():
+    try:
+        if not processing_complete:
+            raise HTTPException(status_code=202, detail="Processing not complete. Please try again later.")
+        if not processed_data:
+            raise HTTPException(status_code=404, detail="No processed data available.")
+        return JSONResponse(content={"invoice_data": processed_data})
+    except Exception as e:
+        return HTTPException(status_code=500, detail=str(e))
     
 @app.get("/get_processed_invoices/{request_id}")
 async def get_processed_invoices(request_id: str):
     try:
-        refa = db.reference(f'output_data/{request_id}')
-        print("Request loaded")        
-        data = refa.get()
-        print("Data Fetched Successfully")
-        if data and 'result' in data:
-            return JSONResponse(
-                content={"request_id": request_id, "invoice_data": data['result']}
-            )
-        elif data:
-            return JSONResponse(
-                content={
-                    "request_id": request_id,
-                    "error": "'result' key not found in the data."
-                },
-                status_code=404
-            )
-        else:
-            return JSONResponse(
-                content={
-                    "request_id": request_id,
-                    "error": f"No data found for request_id: {request_id}"
-                },
-                status_code=404
-            )
-        
+        request_data = request_data_store.get(request_id)
+        if not request_data:
+            raise HTTPException(status_code=404, detail="Request not found")
+        if request_data["status"] == "processing":
+            raise HTTPException(status_code=202, detail="Processing not complete")
+        if request_data["status"] == "error":
+            raise HTTPException(status_code=500, detail=request_data["error"])
+        return {"invoice_data": request_data["data"]}       
     except Exception as e:
-        # Handle any exceptions during fetching
-        return JSONResponse(
-            content={
-                "request_id": request_id,
-                "error": str(e),
-                "message": "An error occurred while fetching the data."
-            },
-            status_code=500
-        )
+        return HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def root():
-    return {"message": "Hey Just Welcome to the BluOrgin FirebaseAI's Invoice Application Processor! add /upload-invoice to the URL to upload an invoice image."}
-
-
-# password = "testpassword123"
-# hashed_password = get_password_hash(password)
-# print(hashed_password)
+    return {"message": "Hey!! Welcome to the BluOrgin AI's Invoice Application Processor! add /docs to proceed"}
