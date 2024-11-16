@@ -89,7 +89,9 @@ endpoint = "https://my-ocr-image.cognitiveservices.azure.com/"
 computervision_client = ComputerVisionClient(endpoint, CognitiveServicesCredentials(subscription_key))
 
 CredentialCertificate = os.environ.get('CREDENTIALCERTIFICATE')
-cred = credentials.Certificate(CredentialCertificate)
+firebase_credentials_dict = json.loads(CredentialCertificate)
+
+cred = credentials.Certificate(firebase_credentials_dict)
 firebase_admin.initialize_app(cred, {
     'databaseURL': 'https://bluorigin-859f2-default-rtdb.asia-southeast1.firebasedatabase.app/'
 })
