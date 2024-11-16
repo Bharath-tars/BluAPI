@@ -15,6 +15,5 @@ pydantic
 passlib
 python-jose
 uuid-utils
-aioredis
 fastapi-limiter
 firebase-admin
