@@ -254,6 +254,13 @@ def sno():
             code = str(ft.readline())
             sno = str(code) + str(no)
     return sno
+async def rearrange_data(data):
+    key_string = ""
+    for key in data:
+        key_string += key + " "
+    data["key_string"] = key_string
+    return data
+    
 
 async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
     all_data = []
@@ -361,10 +368,12 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
                     summary_data[f"Rate_{i}"] = item.get("rate", "not found")
                     summary_data[f"Amount_{i}"] = item.get("amount", "not found")
 
-        all_data.append(summary_data)
+        rearrangedata = await rearrange_data(summary_data)
+        all_data.append(rearrangedata)
+
     logs["invoice_output_ids"] = all_ids
     logs["openai_outputs"] = responses
-    return pd.DataFrame(all_data)
+    return all_data
 
 # Function to extract text from image using Azure OCR
 async def extract_text_from_image(image_path, retries=3):
@@ -449,16 +458,16 @@ async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), mo
         print("Invoice data extracted successfully.")
         print(results)
 
-        invoice_data_dict = results.replace({np.nan: "NULL"}).to_dict(orient='records')
+        # invoice_data_dict = results.replace({np.nan: "NULL"}).to_dict(orient='records')
         processing_complete = True  # Set the flag when processing is complete
-        logs["invoices_result"] = invoice_data_dict
+        logs["invoices_result"] = results
         refa = db.reference('output_data/' + request_id)
 
         refa.set({
                 "time_stamp": logs["time_stamp"],
-                "result": invoice_data_dict,
+                "result": results,
         })
-        return JSONResponse(content={"request_id": request_id, "invoice_data": invoice_data_dict}) 
+        return JSONResponse(content={"request_id": request_id, "invoice_data": results}) 
        
     except Exception as e:
         return HTTPException(status_code=500, detail=str(e))
@@ -487,6 +496,25 @@ async def process_image(file_path: str):
     print(f"OCR extraction took {time.time() - start_time:.2f} seconds")
     return ocr_text
 
+async def original_format(data):
+    final_list = []
+    for db_dict in data:  # Loop over the list
+        if not isinstance(db_dict, dict):  # Ensure each item is a dictionary
+            continue
+        
+        inside_dict = {}
+        key_string = db_dict.get("key_string", "")  # Safely get 'key_string'
+        keys = key_string.split()
+        
+        for key in keys:
+            if key == "key_string":
+                continue
+            if key in db_dict:
+                inside_dict[key] = db_dict[key]
+        
+        final_list.append(inside_dict)
+
+    return final_list
     
 @app.get("/get_processed_invoices/{request_id}")
 async def get_processed_invoices(request_id: str, current_user: User = Depends(get_current_user)):
@@ -499,8 +527,10 @@ async def get_processed_invoices(request_id: str, current_user: User = Depends(g
         data = refa.get()
         print("Data Fetched Successfully")
         if data and 'result' in data:
+            db_data = data['result']
+            real_data = await original_format(db_data)
             return JSONResponse(
-                content={"request_id": request_id, "invoice_data": data['result']}
+                content={"request_id": request_id, "invoice_data": real_data}
             )
         elif data:
             return JSONResponse(
