@@ -307,6 +307,8 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
         - Ensure that "Vendor" and "Buyer" details are not confused. Vendor is the seller, typically mentioned first, and is associated with "GSTIN" or "PAN".
         - Avoid confusing cumulative quantities with rates. Quantities are usually numeric values with units like "CUM", "KG", or "L". Rates are monetary values with currency symbols like "₹" or "$".
         - If any fields are not found, return "None" as the value.
+        - In the Json response, if any field is not found, please return "not found" instead of null.
+        - In the Json responce, if any key name has more than one word, please use underscore(_) instead of space.
 
         **Please provide only the JSON content, without any code block markers, explanations, or extra text. Start directly with open brackets and end with closed brackets, formatted as plain JSON.**
         """
