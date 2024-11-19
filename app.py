@@ -28,8 +28,9 @@ from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr
 import re
-from typing import Optional, Dict, Any
-
+from typing import Optional, Dict, Any, List
+from collections import Counter
+from statistics import mean
 
 if not firebase_admin._apps:
     CredentialCertificate = os.environ.get('CREDENTIALCERTIFICATE')
@@ -90,6 +91,21 @@ class UserInDB(UserBase):
     login_count: int = 0  # Default is 0
     logout_count: int = 0  # Default is 0
     time_spent: Dict[str, float] = {}  # Default to an empty dictionary
+
+
+class StatisticsResponse(BaseModel):
+    avg_ocr_time_per_invoice: float
+    avg_ai_time_per_invoice: float
+    avg_ocr_cost_per_invoice: float
+    avg_ai_cost_per_invoice: float
+    total_invoices_processed: int
+    total_time_spent: float
+    total_cost: float
+    most_used_model: str
+    gpt_3_5_usage_percentage: float
+    gpt_4_usage_percentage: float
+    avg_cost_per_invoice: float
+    avg_time_taken_per_invoice: float
 
 # FastAPI app instance
 app = FastAPI()
@@ -352,37 +368,49 @@ async def get_activity_logs(username: str, token: str = Depends(oauth2_scheme)):
     return db.reference(f"/users/{username}/activity_logs").get() or {"logins": [], "logouts": []}
 
 # Admin route to get user stats
-@app.get("/user/{username}/stats")
-async def get_user_stats(username: str):
-    user_data = get_user_from_firebase(username)
-    if not user_data:
-        raise HTTPException(status_code=404, detail="User not found.")
-    
-    # Ensure time_spent is a dictionary, or set it to an empty dictionary
-    time_spent_data = user_data.get("time_spent", {})
-    if not isinstance(time_spent_data, dict):
-        time_spent_data = {}
+@app.get("/user/{current_user.username}/stats")
+async def get_user_stats(current_user: UserInDB = Depends(get_current_active_user)):
+    if current_user.disabled: 
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    try:
+        user_data = get_user_from_firebase(current_user.username)
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found.")
+        
+        time_spent_data = user_data.get("time_spent", {})
+        if not isinstance(time_spent_data, dict):
+            time_spent_data = {}
 
-    # Calculate total time spent (in seconds) and convert to minutes
-    total_time_spent_seconds = sum(time_spent_data.values())
-    total_time_spent_minutes = total_time_spent_seconds / 60  # Convert to minutes
+        total_time_spent_seconds = sum(time_spent_data.values())
+        total_time_spent_minutes = total_time_spent_seconds / 60  # Convert to minutes
 
-    # Get the time spent for the current month (in minutes)
-    current_month = datetime.utcnow().strftime("%Y-%m")
-    time_spent_current_month_seconds = time_spent_data.get(current_month, 0)
-    time_spent_current_month_minutes = time_spent_current_month_seconds / 60  # Convert to minutes
+        current_month = datetime.utcnow().strftime("%Y-%m")
+        time_spent_current_month_seconds = time_spent_data.get(current_month, 0)
+        time_spent_current_month_minutes = time_spent_current_month_seconds / 60  # Convert to minutes
 
-    # Return both total time and monthly breakdown
-    return {
-        "login_count": user_data.get("login_count", 0),
-        "logout_count": user_data.get("logout_count", 0),
-        "time_spent_current_month_minutes": round(time_spent_current_month_minutes, 2),  # Time spent this month
-        "total_time_spent_minutes": round(total_time_spent_minutes, 2),  # Total time spent across all months
-        "monthly_time_spent": {
-            month: round(time_spent_seconds / 60, 2)  # Time spent per month in minutes
-            for month, time_spent_seconds in time_spent_data.items()
+        return {
+            "message": "User statistics retrieved successfully.",
+            "login_count": user_data.get("login_count", 0),
+            "logout_count": user_data.get("logout_count", 0),
+            "time_spent_current_month_minutes": round(time_spent_current_month_minutes, 2),  # Time spent this month
+            "total_time_spent_minutes": round(total_time_spent_minutes, 2),  # Total time spent across all months
+            "monthly_time_spent": {
+                month: round(time_spent_seconds / 60, 2)  
+                for month, time_spent_seconds in time_spent_data.items()
+            }
         }
-    }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "login_count": 0,
+            "logout_count": 0,
+            "time_spent_current_month_minutes": 0,
+            "total_time_spent_minutes": 0,
+            "monthly_time_spent": {}
+        }
+
+
+
 
 
 #Normal processes
@@ -779,6 +807,128 @@ async def get_processed_invoices(request_id: str, current_user: UserInDB = Depen
             },
             status_code=500
         )
+
+
+# Statistics route
+@app.get("/statistics/{current_user.username}", response_model=StatisticsResponse)
+async def get_statistics(current_user: UserInDB = Depends(get_current_active_user)):   
+    if current_user.disabled:  
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    try:
+        user_ref = db.reference(f"users/{current_user.username}")
+        user_data = user_ref.get()
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_request_ids = user_data.get("request_ids", [])
+        if not user_request_ids:
+            raise HTTPException(status_code=404, detail="No request IDs found for this user")
+
+        logs_ref = db.reference("logs")
+        logs_data = logs_ref.get()
+        if not logs_data:
+            raise HTTPException(status_code=404, detail="No logs found in the database")
+
+        filtered_logs = [logs_data[req_id] for req_id in user_request_ids if req_id in logs_data]
+
+        if not filtered_logs:
+            raise HTTPException(status_code=404, detail="No logs found for the user's request IDs")
+
+        ocr_times, ai_times, ocr_costs, ai_costs, invoice_counts = [], [], [], [], []
+        total_time, total_cost = 0, 0
+        model_usage = Counter()
+
+        for log in filtered_logs:
+            content = log.get("content", {})
+            ocr_times.append(content.get("ocr_time", 0))
+            ai_times.append(content.get("ai_time", 0))
+            ocr_costs.append(content.get("ocr_cost", 0))
+            ai_costs.append(content.get("ai_cost", 0))
+            invoice_counts.append(content.get("invoice_count", 0))
+            total_time += content.get("total_time", 0)
+            total_cost += content.get("total_cost", 0)
+            model_usage[content.get("model_name", "unknown")] += 1
+
+        total_invoices = sum(invoice_counts)
+        avg_ocr_time_per_invoice = mean(ocr_times) if ocr_times else 0
+        avg_ai_time_per_invoice = mean(ai_times) if ai_times else 0
+        avg_ocr_cost_per_invoice = mean(ocr_costs) if ocr_costs else 0
+        avg_ai_cost_per_invoice = mean(ai_costs) if ai_costs else 0
+
+        most_used_model, most_used_count = model_usage.most_common(1)[0] if model_usage else ("unknown", 0)
+        gpt_3_5_count = model_usage.get("gpt-3.5", 0)
+        gpt_4_count = model_usage.get("gpt-4", 0)
+        gpt_3_5_usage_percentage = (gpt_3_5_count / sum(model_usage.values()) * 100) if model_usage else 0
+        gpt_4_usage_percentage = (gpt_4_count / sum(model_usage.values()) * 100) if model_usage else 0
+        avg_cost_per_invoice = total_cost / total_invoices if total_invoices else 0
+        avg_time_taken_per_invoice = total_time / total_invoices if total_invoices else 0
+
+        return StatisticsResponse(
+            avg_ocr_time_per_invoice=avg_ocr_time_per_invoice,
+            avg_ai_time_per_invoice=avg_ai_time_per_invoice,
+            avg_ocr_cost_per_invoice=avg_ocr_cost_per_invoice,
+            avg_ai_cost_per_invoice=avg_ai_cost_per_invoice,
+            total_invoices_processed=total_invoices,
+            total_time_spent=total_time,
+            total_cost=total_cost,
+            most_used_model=most_used_model,
+            gpt_3_5_usage_percentage=gpt_3_5_usage_percentage,
+            gpt_4_usage_percentage=gpt_4_usage_percentage,
+            avg_cost_per_invoice=avg_cost_per_invoice,
+            avg_time_taken_per_invoice=avg_time_taken_per_invoice
+        )
+    except Exception as e:
+        return StatisticsResponse(
+            avg_ocr_time_per_invoice=0,
+            avg_ai_time_per_invoice=0,
+            avg_ocr_cost_per_invoice=0,
+            avg_ai_cost_per_invoice=0,
+            total_invoices_processed=0,
+            total_time_spent=0,
+            total_cost=0,
+            most_used_model="unknown",
+            gpt_3_5_usage_percentage=0,
+            gpt_4_usage_percentage=0,
+            avg_cost_per_invoice=0,
+            avg_time_taken_per_invoice=0
+        )
+
+
+# User history route
+@app.get("/user_history/{current_user.username}", response_model=Dict[str, List[Dict]])
+async def user_history(current_user: UserInDB = Depends(get_current_active_user)):
+    if current_user.disabled: 
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+    try:
+        user_ref = db.reference(f"users/{current_user.username}")
+        user_data = user_ref.get()
+        if not user_data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        user_request_ids = user_data.get("request_ids", [])
+        if not user_request_ids:
+            raise HTTPException(status_code=404, detail="No request IDs found for this user")
+
+        outputs_ref = db.reference("output_data")
+        outputs_data = outputs_ref.get()
+        if not outputs_data:
+            raise HTTPException(status_code=404, detail="No output data found in the database")
+
+        filtered_outputs = [outputs_data[req_id] for req_id in user_request_ids if req_id in outputs_data]
+
+        if not filtered_outputs:
+            raise HTTPException(status_code=404, detail="No output data found for the user's request IDs")
+
+        results = []
+        for output in filtered_outputs:
+            result_data = output.get("result", [])
+            if isinstance(result_data, list):
+                results.extend(result_data)
+
+        return {"results": results}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 @app.get("/")
 async def root():
