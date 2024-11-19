@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form, status
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, status, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -15,7 +15,6 @@ import asyncio
 import shutil
 import numpy as np
 from datetime import date
-from fastapi import FastAPI, Depends, HTTPException, status, Request
 import time
 import uuid
 import firebase_admin
@@ -27,51 +26,71 @@ from passlib.context import CryptContext
 import time
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 import re
+from typing import Optional, Dict, Any
 
 
+if not firebase_admin._apps:
+    cred = credentials.Certificate("bluorigin-859f2-firebase-adminsdk-5jn3f-18a4123268.json")
+    firebase_admin.initialize_app(cred, {
+        'databaseURL': 'https://bluorigin-859f2-default-rtdb.asia-southeast1.firebasedatabase.app/'
+})
 
+# Security configurations
 SECRET_KEY = "83daa0256a2289b0fb23693bf1f6034d44396675749244721a2b20e896e11662"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-
-fake_db = {
-    "testuser": {
-        "username": "testuser",
-        "hashed_password": "$2b$12$dCpkIfEbHLNiOOCQUrFoNeSWLCYPsabGcUu.xmu1XNTiohE1.0ObK",  # password: "testpassword123"
-        "full_name": "Test User",
-        "email": "test@gmail.com",
-        "disabled": False
-
-    }
+AVAILABLE_MODELS = {
+    'gpt-4': 'gpt-4',
+    'gpt-3.5': 'gpt-3.5-turbo'
 }
+DEFAULT_MODEL = 'gpt-3.5'
+
+start_time_ai = 0
+start_time_ocr = 0
+end_time_ai = 0
+end_time_ocr = 0
+
+logs = {}
+ai_money = 0
+
+
+API_KEY = "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"
+subscription_key = "9VyengLPTp5sLNQQms00PWUkAjUI7rZKX2p1UmPJspRkPxQ07DANJQQJ99AKACqBBLyXJ3w3AAAFACOGPbfr"
+endpoint = "https://my-ocr-image.cognitiveservices.azure.com/"
+computervision_client = ComputerVisionClient(endpoint, CognitiveServicesCredentials(subscription_key))
+
+# Password hashing setup
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# Models for data validation
+class UserBase(BaseModel):
+    username: str
+    email: EmailStr
+    disabled: Optional[bool] = False
+    full_name: Optional[str] = None
+
+class UserCreate(UserBase):
+    password: str
 
 class Token(BaseModel):
     access_token: str
     token_type: str
 
-
 class TokenData(BaseModel):
-    username: str | None = None
+    username: Optional[str] = None
 
-
-class User(BaseModel):
-    username: str
-    email: str | None = None
-    full_name: str | None = None
-    disabled: bool | None = None
-
-
-class UserInDB(User):
+class UserInDB(UserBase):
     hashed_password: str
+    disabled: bool = False  # Default is False, no need for Optional
+    login_count: int = 0  # Default is 0
+    logout_count: int = 0  # Default is 0
+    time_spent: Dict[str, float] = {}  # Default to an empty dictionary
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
-
-
-
+# FastAPI app instance
 app = FastAPI()
 
 app.add_middleware(
@@ -83,111 +102,289 @@ app.add_middleware(
 )
 
 
-API_KEY = os.environ.get("OPENAI_API_KEY")
-subscription_key = os.environ.get("AZURE_SUBSCRIPTION_KEY")
-endpoint = "https://my-ocr-image.cognitiveservices.azure.com/"
-computervision_client = ComputerVisionClient(endpoint, CognitiveServicesCredentials(subscription_key))
 
-CredentialCertificate = os.environ.get('CREDENTIALCERTIFICATE')
-firebase_credentials_dict = json.loads(CredentialCertificate)
-
-cred = credentials.Certificate(firebase_credentials_dict)
-firebase_admin.initialize_app(cred, {
-    'databaseURL': 'https://bluorigin-859f2-default-rtdb.asia-southeast1.firebasedatabase.app/'
-})
-
-
-AVAILABLE_MODELS = {
-    'gpt-4': 'gpt-4',
-    'gpt-3.5': 'gpt-3.5-turbo'
-}
-DEFAULT_MODEL = 'gpt-4'
-
-start_time_ai = 0
-start_time_ocr = 0
-end_time_ai = 0
-end_time_ocr = 0
-
-
-logs = {}
-ai_money = 0
-
-
-
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password):
+# Utility functions
+def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
 
-def get_user(fake_db, username: str):
-    if username in fake_db:
-        user_data = fake_db[username]
-        return UserInDB(**user_data)
-
-
-def authenticate_user(fake_db, username: str, password: str):
-    user = get_user(fake_db, username)
-    if not user:
-        return False
-    if not verify_password(password, user.hashed_password):
-        return False
-
-    return user
-
-def create_access_token(data: dict, expires_delta: timedelta | None = None):
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+# Firebase helpers
+def get_user_from_firebase(username: str) -> Optional[dict]:
+    users_ref = db.reference("/users")
+    user_data = users_ref.child(username).get()
+    if user_data and "time_spent" not in user_data:
+        user_data["time_spent"] = {}
+    return user_data
+
+def get_user_by_email(email: str) -> Optional[dict]:
+    users_ref = db.reference("/users")
+    users = users_ref.get() or {}
+    for user in users.values():
+        if user.get("email") == email:
+            return user
+    return None
+
+def add_user_to_firebase(user: Dict[str, Any]):
+    users_ref = db.reference("/users")
+    users_ref.child(user["username"]).set(user)
+
+def update_user_login(username: str):
+    try:
+        user_ref = db.reference(f"/users/{username}")
+        now = datetime.utcnow().isoformat()
+
+        # Fetch existing user data
+        user_data = user_ref.get()
+        current_login_count = user_data.get("login_count", 0) if user_data else 0
+
+        # Increment login count and update
+        user_ref.update({
+            "login_count": current_login_count + 1,
+            "last_login": now
+        })
+    except Exception as e:
+        print(f"Error updating user login: {e}")
+
+def update_user_logout(username: str):
+    try:
+        user_ref = db.reference(f"/users/{username}")
+        user_data = user_ref.get()
+
+        if user_data is None:
+            raise ValueError(f"No data found for username: {username}")
+
+        now = datetime.utcnow()
+        last_login = user_data.get("last_login")
+        time_spent = user_data.get("time_spent", {})
+
+        # Ensure `time_spent` is a dictionary
+        if not isinstance(time_spent, dict):
+            time_spent = {}
+
+        session_duration = 0
+        if last_login:
+            try:
+                last_login_time = datetime.fromisoformat(last_login)
+                session_duration = (now - last_login_time).total_seconds()
+            except ValueError:
+                print(f"Invalid `last_login` format for user {username}: {last_login}")
+
+        # Determine the current month (Year-Month)
+        current_month = now.strftime("%Y-%m")
+        monthly_time = time_spent.get(current_month, 0)
+
+        # Update monthly time spent
+        updated_monthly_time = monthly_time + session_duration
+        time_spent[current_month] = updated_monthly_time
+
+        # Retrieve current logout count, increment it, and update
+        logout_count = user_data.get("logout_count", 0)
+        logout_count += 1
+
+        # Update the user's data in the database
+        user_ref.update({
+            "logout_count": logout_count,  # Manually increment logout count
+            "last_logout": now.isoformat(),
+            "time_spent": time_spent
+        })
+    except Exception as e:
+        print(f"Error updating user logout: {e}")
 
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credential_exception = HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                                         detail="Could not validate credentials", headers={"WWW-Authenticate": "Bearer"})
+
+def revoke_token(token: str):
+    blacklist_ref = db.reference("/token_blacklist")
+    blacklist_ref.push({
+        "token": token,
+        "revoked_at": datetime.utcnow().isoformat()
+    })
+
+
+def is_token_revoked(token: str) -> bool:
+    blacklist_ref = db.reference("/token_blacklist")
+    tokens = blacklist_ref.get() or {}  # Fetch all revoked tokens; default to an empty dict
+    for entry in tokens.values():
+        if entry.get("token") == token:
+            return True
+    return False
+
+
+
+
+# Dependencies
+def get_current_user(token: str = Depends(oauth2_scheme)) -> UserInDB:
+    
+    if is_token_revoked(token):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
-            raise credential_exception
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
-        token_data = TokenData(username=username)
-    except JWTError:
-        raise credential_exception
+    user_data = get_user_from_firebase(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found.")
+    if not isinstance(user_data.get("time_spent", {}), dict):
+        user_data["time_spent"] = {}
+    return UserInDB(**user_data)
 
-    user = get_user(fake_db, username=token_data.username)
-    if user is None:
-        raise credential_exception
-
-    return user
-
-
-async def get_current_active_user(current_user: UserInDB = Depends(get_current_user)):
+def get_current_active_user(current_user: UserInDB = Depends(get_current_user)) -> UserInDB:
     if current_user.disabled:
-        raise HTTPException(status_code=400, detail="Inactive user")
-
+        raise HTTPException(status_code=403, detail="Inactive user.")
     return current_user
 
 
-@app.post("/token", response_model=Token)
+# API routes
+# Signup route
+@app.post("/signup", status_code=201)
+async def signup(user: UserCreate):
+    existing_user = get_user_from_firebase(user.username)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Username already exists.")
+
+    if get_user_by_email(user.email):
+        raise HTTPException(status_code=400, detail="Email already registered.")
+    
+    hashed_password = get_password_hash(user.password)
+    user_data = {
+        "username": user.username,
+        "email": user.email,
+        "full_name": user.full_name,
+        "hashed_password": hashed_password,
+        "disabled": False,
+        "created_at": datetime.utcnow().isoformat(),
+        "login_count": 0,
+        "logout_count": 0,
+        "time_spent": {},  # Ensure time_spent is a dictionary
+        "last_login": None,
+        "last_logout": None
+    }
+    add_user_to_firebase(user_data)
+    return {"message": "User created successfully."}
+
+
+# Login route
+@app.post("/login", response_model=Token)
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = authenticate_user(fake_db, form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
-                            detail="Incorrect username or password", headers={"WWW-Authenticate": "Bearer"})
+    user_data = get_user_from_firebase(form_data.username)
+    if not user_data:
+        raise HTTPException(status_code=401, detail="Incorrect username")
+    if not verify_password(form_data.password, user_data["hashed_password"]):
+        raise HTTPException(status_code=401, detail="Incorrect password.")
+    if user_data.get("disabled", False):
+        raise HTTPException(status_code=403, detail="User account is disabled.")
+
+    update_user_login(form_data.username)
+    db.reference(f"/users/{form_data.username}/activity_logs/logins").push(datetime.utcnow().isoformat())
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(data={"sub": user.username}, expires_delta=access_token_expires)
+    access_token = create_access_token(data={"sub": form_data.username}, expires_delta=access_token_expires)
+
     return {"access_token": access_token, "token_type": "bearer"}
 
 
+# Logout route
+@app.post("/logout")
+async def logout(current_user: UserInDB = Depends(get_current_active_user),token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token.")
+        timestamp = datetime.utcnow().isoformat()
+        users_ref = db.reference(f"/users/{username}/activity_logs")
+        users_ref.child("logouts").push(timestamp)
+        update_user_logout(current_user.username)
+        revoke_token(token)
+        return {"message": "Logged out successfully."}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired.")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Could not validate token.")
 
+
+
+# User profile route
+@app.get("/me", response_model=UserBase)
+async def read_current_user(current_user: UserInDB = Depends(get_current_active_user)):
+    return current_user
+
+
+# Admin routes
+@app.get("/activity_logs/{username}")
+async def get_activity_logs(username: str, token: str = Depends(oauth2_scheme)):
+    user_data = get_user_from_firebase(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found.")
+    return db.reference(f"/users/{username}/activity_logs").get() or {"logins": [], "logouts": []}
+
+# Admin route to get user stats
+@app.get("/user/{username}/stats")
+async def get_user_stats(username: str):
+    user_data = get_user_from_firebase(username)
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found.")
+    
+    # Ensure time_spent is a dictionary, or set it to an empty dictionary
+    time_spent_data = user_data.get("time_spent", {})
+    if not isinstance(time_spent_data, dict):
+        time_spent_data = {}
+
+    # Calculate total time spent (in seconds) and convert to minutes
+    total_time_spent_seconds = sum(time_spent_data.values())
+    total_time_spent_minutes = total_time_spent_seconds / 60  # Convert to minutes
+
+    # Get the time spent for the current month (in minutes)
+    current_month = datetime.utcnow().strftime("%Y-%m")
+    time_spent_current_month_seconds = time_spent_data.get(current_month, 0)
+    time_spent_current_month_minutes = time_spent_current_month_seconds / 60  # Convert to minutes
+
+    # Return both total time and monthly breakdown
+    return {
+        "login_count": user_data.get("login_count", 0),
+        "logout_count": user_data.get("logout_count", 0),
+        "time_spent_current_month_minutes": round(time_spent_current_month_minutes, 2),  # Time spent this month
+        "total_time_spent_minutes": round(total_time_spent_minutes, 2),  # Total time spent across all months
+        "monthly_time_spent": {
+            month: round(time_spent_seconds / 60, 2)  # Time spent per month in minutes
+            for month, time_spent_seconds in time_spent_data.items()
+        }
+    }
+
+
+#Normal processes
 def ocr_cost(calls):
     return calls * 0.084076
 
@@ -254,13 +451,15 @@ def sno():
             code = str(ft.readline())
             sno = str(code) + str(no)
     return sno
+
+
 async def rearrange_data(data):
     key_string = ""
     for key in data:
         key_string += key + " "
     data["key_string"] = key_string
     return data
-    
+
 
 async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
     all_data = []
@@ -306,8 +505,7 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
         Important:
         - Ensure that "Vendor" and "Buyer" details are not confused. Vendor is the seller, typically mentioned first, and is associated with "GSTIN" or "PAN".
         - Avoid confusing cumulative quantities with rates. Quantities are usually numeric values with units like "CUM", "KG", or "L". Rates are monetary values with currency symbols like "₹" or "$".
-        - If any fields are not found, return "None" as the value.
-        - In the Json response, if any field is not found, please return "not found" instead of null.
+        - If any fields are not found, return "Not found" as the value in string format instead of null or None.
         - In the Json responce, if any key name has more than one word, please use underscore(_) instead of space.
 
         **Please provide only the JSON content, without any code block markers, explanations, or extra text. Start directly with open brackets and end with closed brackets, formatted as plain JSON.**
@@ -412,8 +610,16 @@ async def extract_text_from_image(image_path, retries=3):
 
     raise Exception("Failed to extract text from image after multiple retries.")
 
+
+async def process_image(file_path: str):
+    start_time = time.time()
+    ocr_text = await extract_text_from_image(file_path)
+    print(f"OCR extraction took {time.time() - start_time:.2f} seconds")
+    return ocr_text
+
+
 @app.post("/process_invoices")
-async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), model_name: str = DEFAULT_MODEL, current_user: User = Depends(get_current_user)):
+async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), model_name: str = DEFAULT_MODEL, current_user: UserInDB = Depends(get_current_active_user),token: str = Depends(oauth2_scheme)):
     if current_user.disabled: 
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
     
@@ -421,7 +627,6 @@ async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), mo
     request_id = str(uuid.uuid4())
     processing_complete = False  
     file_paths = []
-
 
     for file in invoice_files:
         filename = f"temp_{file.filename}"
@@ -463,14 +668,31 @@ async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), mo
         # invoice_data_dict = results.replace({np.nan: "NULL"}).to_dict(orient='records')
         processing_complete = True  # Set the flag when processing is complete
         logs["invoices_result"] = results
-        refa = db.reference('output_data/' + request_id)
+        try:
+            refa = db.reference('output_data/' + request_id)
+            refa.set({
+                    "time_stamp": logs["time_stamp"],
+                    "request_id": request_id,
+                    "result": results,
+            })
+            print("Written results to firebase")
 
-        refa.set({
-                "time_stamp": logs["time_stamp"],
-                "result": results,
-        })
-        return JSONResponse(content={"request_id": request_id, "invoice_data": results}) 
-       
+            # Capture user details and update the user profile with the new request_id
+            user_ref = db.reference(f'/users/{current_user.username}')
+            user_data = user_ref.get()  # Get the current data
+            current_request_ids = user_data.get("request_ids", []) if user_data else []
+            if request_id not in current_request_ids:
+                current_request_ids.append(request_id)
+
+            user_ref.update({
+                "request_ids": current_request_ids  # Update the list with the new request_id
+            })
+            print(f"Request ID {request_id} assigned to user {current_user.username}")
+
+            return JSONResponse(content={"request_id": request_id, "invoice_data": results}) 
+        except Exception as e:
+            return HTTPException(status_code=500, detail=str(e))
+          
     except Exception as e:
         return HTTPException(status_code=500, detail=str(e))
     
@@ -482,7 +704,7 @@ async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), mo
                 print(f"File not found: {path}")
             except Exception as e:
                 print(f"Error while removing file {path}: {str(e)}")
-
+        print("Removed files")
         output_id = request_id
         ref = db.reference('logs/' + output_id)
         ref.set({
@@ -492,11 +714,6 @@ async def batch_process_invoices(invoice_files: List[UploadFile] = File(...), mo
         })
         print("Data Pushed to Firebase")
 
-async def process_image(file_path: str):
-    start_time = time.time()
-    ocr_text = await extract_text_from_image(file_path)
-    print(f"OCR extraction took {time.time() - start_time:.2f} seconds")
-    return ocr_text
 
 async def original_format(data):
     final_list = []
@@ -517,9 +734,10 @@ async def original_format(data):
         final_list.append(inside_dict)
 
     return final_list
+
     
 @app.get("/get_processed_invoices/{request_id}")
-async def get_processed_invoices(request_id: str, current_user: User = Depends(get_current_user)):
+async def get_processed_invoices(request_id: str, current_user: UserInDB = Depends(get_current_active_user)):
     if current_user.disabled:  # Example of checking user permissions
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
     
@@ -564,8 +782,3 @@ async def get_processed_invoices(request_id: str, current_user: User = Depends(g
 @app.get("/")
 async def root():
     return {"message": "Hey Just Welcome to the BluOrgin FirebaseAI's Invoice Application Processor! add /upload-invoice to the URL to upload an invoice image."}
-
-
-# password = "testpassword123"
-# hashed_password = get_password_hash(password)
-# print(hashed_password)
