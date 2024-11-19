@@ -32,11 +32,13 @@ from typing import Optional, Dict, Any
 
 
 if not firebase_admin._apps:
-    cred = credentials.Certificate("bluorigin-859f2-firebase-adminsdk-5jn3f-18a4123268.json")
+    CredentialCertificate = os.environ.get('CREDENTIALCERTIFICATE')
+    firebase_credentials_dict = json.loads(CredentialCertificate)
+    cred = credentials.Certificate(firebase_credentials_dict)
     firebase_admin.initialize_app(cred, {
         'databaseURL': 'https://bluorigin-859f2-default-rtdb.asia-southeast1.firebasedatabase.app/'
-})
-
+    })
+    
 # Security configurations
 SECRET_KEY = "83daa0256a2289b0fb23693bf1f6034d44396675749244721a2b20e896e11662"
 ALGORITHM = "HS256"
@@ -56,9 +58,8 @@ end_time_ocr = 0
 logs = {}
 ai_money = 0
 
-
-API_KEY = "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"
-subscription_key = "9VyengLPTp5sLNQQms00PWUkAjUI7rZKX2p1UmPJspRkPxQ07DANJQQJ99AKACqBBLyXJ3w3AAAFACOGPbfr"
+API_KEY = os.environ.get("OPENAI_API_KEY")
+subscription_key = os.environ.get("AZURE_SUBSCRIPTION_KEY")
 endpoint = "https://my-ocr-image.cognitiveservices.azure.com/"
 computervision_client = ComputerVisionClient(endpoint, CognitiveServicesCredentials(subscription_key))
 
