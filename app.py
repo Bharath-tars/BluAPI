@@ -31,6 +31,8 @@ import re
 from typing import Optional, Dict, Any, List
 from collections import Counter
 from statistics import mean
+import mimetypes
+
 
 if not firebase_admin._apps:
     CredentialCertificate = os.environ.get('CREDENTIALCERTIFICATE')
@@ -489,6 +491,7 @@ async def rearrange_data(data):
     data["key_string"] = key_string
     return data
 
+
 async def validate_and_format_data(data):
     def format_amount(amount):
         try:
@@ -497,6 +500,7 @@ async def validate_and_format_data(data):
             return formatted_amount
         except ValueError:
             return "not found"
+
     def format_tax_rate(rate):
         try:
             rate = re.sub(r'[^\d.]+', '', rate)  
@@ -506,12 +510,30 @@ async def validate_and_format_data(data):
             return "not found"
         except ValueError:
             return "not found"
+
     for key in data.keys():
         if "amount" in key.lower():
             data[key] = format_amount(data[key])
         if "rate" in key.lower() and "tax" in key.lower():
             data[key] = format_tax_rate(data[key])
+    
     return data
+
+
+async def calculate_total_amount_before_tax(data):
+    def extract_numeric_amount(amount_str):
+        try:
+            return float(re.sub(r'[^\d.]', '', amount_str))  
+        except ValueError:
+            return 0.0
+
+    total_amount = extract_numeric_amount(data.get("Total_Amount", "0"))    
+    tax_keys = [key for key in data.keys() if key.startswith("Tax_Amount")]
+    total_tax_amount = sum(extract_numeric_amount(data.get(key, "0")) for key in tax_keys)    
+    total_amount_before_tax = total_amount - total_tax_amount    
+    formatted_amount_before_tax = f"₹ {total_amount_before_tax:,.2f}"
+    return formatted_amount_before_tax
+
 
 
 async def convert_keys_to_lowercase(data):
@@ -521,7 +543,6 @@ async def convert_keys_to_lowercase(data):
         return [await convert_keys_to_lowercase(item) for item in data]
     else:
         return data
-
 
 async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
     all_data = []
@@ -563,7 +584,6 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
         - grand_total_amount: Total amount payable after all taxes and other charges, formatted as ₹ X,XXX.XX.
         - other_charges: Any additional charges such as transport or handling charges.
         - other_charges_amount: The amount for other charges, formatted as ₹ X,XXX.XX.
-        - total_amount_before_tax: The total amount payable before taxes, formatted as ₹ X,XXX.XX.
 
         Important:
         - Ensure that "Vendor" and "Buyer" details are not confused. Vendor is the seller, typically mentioned first, and is associated with "GSTIN" or "PAN".
@@ -610,7 +630,6 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
             "Total_Amount": invoice_data.get("grand_total_amount", "not found"),
             "Other_Charges": invoice_data.get("other_charges", "not found"),
             "Other_Charges_Amount": invoice_data.get("other_charges_amount", "not found"),
-            "total_amount_before_tax": invoice_data.get("total_amount_before_tax", "not found")
         }
 
         # Handle tax details if available
@@ -634,6 +653,7 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
                     summary_data[f"Rate_{i}"] = item.get("rate", "not found")
                     summary_data[f"Amount_{i}"] = item.get("amount", "not found")
 
+        summary_data["total_amount_before_tax"] = await calculate_total_amount_before_tax(summary_data)
         validated_data = await validate_and_format_data(summary_data)
         rearrangedata = await rearrange_data(validated_data)
         all_data.append(rearrangedata)
@@ -641,28 +661,32 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
     logs["invoice_output_ids"] = all_ids
     logs["openai_outputs"] = responses
     return all_data
-
+    
 
 # Function to extract text from image using Azure OCR
 async def extract_text_from_image(image_path, retries=3):
     for attempt in range(retries):
         try:
-            with open(image_path, "rb") as image_stream:
-                read_response = computervision_client.read_in_stream(image=image_stream, raw=True)
+            mime_type, _ = mimetypes.guess_type(image_path)
+            with open(image_path, "rb") as file_stream:
+                if mime_type in ["application/pdf"]:
+                    # Process PDF files
+                    read_response = computervision_client.read_in_stream(image=file_stream, raw=True)
+                elif mime_type in ["image/jpeg", "image/png", "image/jpg"]:
+                    # Process image files
+                    read_response = computervision_client.read_in_stream(image=file_stream, raw=True)
+                else:
+                    raise HTTPException(status_code=400, detail=f"Unsupported file type: {mime_type}")
 
             read_operation_location = read_response.headers["Operation-Location"]
             operation_id = read_operation_location.split("/")[-1]
-            
             await delay_between_requests()
-
             while True:
                 read_result = computervision_client.get_read_result(operation_id)
                 if read_result.status not in ['notStarted', 'running']:
                     break
                 await asyncio.sleep(1)
-
             full_text = ""
-
             if read_result.status == OperationStatusCodes.succeeded:
                 for text_result in read_result.analyze_result.read_results:
                     for line in text_result.lines:
@@ -677,6 +701,7 @@ async def extract_text_from_image(image_path, retries=3):
             delay_between_requests()
 
     raise Exception("Failed to extract text from image after multiple retries.")
+
 
 
 async def process_image(file_path: str):
