@@ -369,7 +369,7 @@ async def get_activity_logs(username: str, token: str = Depends(oauth2_scheme)):
 
 # Admin route to get user stats
 @app.get("/user/{current_user.username}/stats")
-async def get_user_stats(current_user: UserInDB = Depends(get_current_active_user)):
+async def get_user_stats(current_user: UserInDB = Depends(get_current_active_user), token: str = Depends(oauth2_scheme)):
     if current_user.disabled: 
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
     try:
@@ -489,6 +489,39 @@ async def rearrange_data(data):
     data["key_string"] = key_string
     return data
 
+async def validate_and_format_data(data):
+    def format_amount(amount):
+        try:
+            amount = re.sub(r'[^\d.]+', '', amount)  # Remove non-numeric characters
+            formatted_amount = f"₹ {float(amount):,.2f}"
+            return formatted_amount
+        except ValueError:
+            return "not found"
+    def format_tax_rate(rate):
+        try:
+            rate = re.sub(r'[^\d.]+', '', rate)  
+            if rate:
+                formatted_rate = f"{float(rate):.2f}%"
+                return formatted_rate
+            return "not found"
+        except ValueError:
+            return "not found"
+    for key in data.keys():
+        if "amount" in key.lower():
+            data[key] = format_amount(data[key])
+        if "rate" in key.lower() and "tax" in key.lower():
+            data[key] = format_tax_rate(data[key])
+    return data
+
+
+async def convert_keys_to_lowercase(data):
+    if isinstance(data, dict):
+        return {key.lower(): await convert_keys_to_lowercase(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [await convert_keys_to_lowercase(item) for item in data]
+    else:
+        return data
+
 
 async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
     all_data = []
@@ -515,21 +548,22 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
         - buyer_name: The name of the buyer or recipient, typically following "Ship to" or "Buyer".
         - buyer_gst: GST Identification Number of the buyer.
         - shipping_address: Address to which the goods or services are being shipped.
-        - site_name: Site or project name where services/goods are provided, if applicable.
+        - site_name: Site or project name where services/goods are provided, always ending with "site" or "project if applicable.
         - line_items: Extract line items (as an array of objects) containing:
-            - description: Description of the product or service.
-            - hsn_sac_code: HSN or SAC code associated with the item.
-            - quantity: Quantity of items or services, usually a numeric value followed by units like "CUM", "KG", etc.
-            - cumulative_quantity: The cumulative quantity value, usually labeled as "Cumulative Qty" or similar.
-            - rate: Rate per unit, usually a monetary value in ₹ (INR). Avoid taking cumulative quantity values as rates.
-            - amount: Total amount for the line item.
+            - description: Simplified item description (e.g., "Steel Test" from "Steel Test J-D-13-14/01").
+            - hsn_sac_code: 6-digit SAC code or 8-digit HSN code. Ignore codes of incorrect length or invalid characters.
+            - quantity: Numeric value of items, often with units (e.g., "CUM", "KG").
+            - cumulative_quantity: The cumulative quantity value, usually labeled as "Cumulative Qty."
+            - rate: Rate per unit, formatted as ₹ X,XXX.XX.
+            - amount: Total amount for the line item, formatted as ₹ X,XXX.XX.
         - tax_details: An array of objects containing tax details:
-            - tax_type: Type of tax (CGST, SGST, IGST, etc.)
-            - rate: Tax rate in percentage.
-            - amount: Amount of tax charged.
-        - total_amount: Total amount payable after all taxes.
+            - tax_type: Type of tax (CGST, SGST, IGST, etc.).
+            - rate: Tax rate in percentage (e.g., "14.00%"). If extracted as '14.00', append '%'.
+            - amount: Amount of tax charged, formatted as ₹ X,XXX.XX.
+        - grand_total_amount: Total amount payable after all taxes and other charges, formatted as ₹ X,XXX.XX.
         - other_charges: Any additional charges such as transport or handling charges.
-        - other_charges_amount: The amount for other charges.
+        - other_charges_amount: The amount for other charges, formatted as ₹ X,XXX.XX.
+        - total_amount_before_tax: The total amount payable before taxes, formatted as ₹ X,XXX.XX.
 
         Important:
         - Ensure that "Vendor" and "Buyer" details are not confused. Vendor is the seller, typically mentioned first, and is associated with "GSTIN" or "PAN".
@@ -557,6 +591,8 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
             print("Response:", invoice_data)
             continue
 
+
+        invoice_data = await convert_keys_to_lowercase(invoice_data)
         # Extract summary data with checks for missing details
         invoice_id  = sno()
         all_ids.append(invoice_id)
@@ -571,9 +607,10 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
             "Buyer_GST": invoice_data.get("buyer_gst", "not found"),
             "Shipping_Address": invoice_data.get("shipping_address", "not found"),
             "Site_or_Project_Name": invoice_data.get("site_name", "not found"),
-            "Total_Amount": invoice_data.get("total_amount", "not found"),
+            "Total_Amount": invoice_data.get("grand_total_amount", "not found"),
             "Other_Charges": invoice_data.get("other_charges", "not found"),
-            "Other_Charges_Amount": invoice_data.get("other_charges_amount", "not found")
+            "Other_Charges_Amount": invoice_data.get("other_charges_amount", "not found"),
+            "total_amount_before_tax": invoice_data.get("total_amount_before_tax", "not found")
         }
 
         # Handle tax details if available
@@ -597,12 +634,14 @@ async def process_invoicing(invoice_texts, model_name=DEFAULT_MODEL):
                     summary_data[f"Rate_{i}"] = item.get("rate", "not found")
                     summary_data[f"Amount_{i}"] = item.get("amount", "not found")
 
-        rearrangedata = await rearrange_data(summary_data)
+        validated_data = await validate_and_format_data(summary_data)
+        rearrangedata = await rearrange_data(validated_data)
         all_data.append(rearrangedata)
 
     logs["invoice_output_ids"] = all_ids
     logs["openai_outputs"] = responses
     return all_data
+
 
 # Function to extract text from image using Azure OCR
 async def extract_text_from_image(image_path, retries=3):
@@ -811,7 +850,7 @@ async def get_processed_invoices(request_id: str, current_user: UserInDB = Depen
 
 # Statistics route
 @app.get("/statistics/{current_user.username}", response_model=StatisticsResponse)
-async def get_statistics(current_user: UserInDB = Depends(get_current_active_user)):   
+async def get_statistics(current_user: UserInDB = Depends(get_current_active_user), token: str = Depends(oauth2_scheme)):   
     if current_user.disabled:  
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
     try:
@@ -896,7 +935,7 @@ async def get_statistics(current_user: UserInDB = Depends(get_current_active_use
 
 # User history route
 @app.get("/user_history/{current_user.username}", response_model=Dict[str, List[Dict]])
-async def user_history(current_user: UserInDB = Depends(get_current_active_user)):
+async def user_history(current_user: UserInDB = Depends(get_current_active_user), token: str = Depends(oauth2_scheme)):
     if current_user.disabled: 
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
     try:
