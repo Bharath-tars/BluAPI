@@ -18,7 +18,7 @@ from datetime import date
 import time
 import uuid
 import firebase_admin
-from firebase_admin import credentials
+from firebase_admin import credentials, initialize_app
 from firebase_admin import db
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
@@ -992,6 +992,127 @@ async def user_history(current_user: UserInDB = Depends(get_current_active_user)
         return {"results": results}
     except Exception as e:
         return {"error": str(e)}
+
+
+#deactivate user
+@app.post("/deactivate_user/{username}")
+async def deactivate_user(username: str):
+    user_ref = db.reference(f"users/{username}")
+    user_data = user_ref.get()
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_ref.update({"disabled": True})
+    return {"message": f"User {username} deactivated successfully."}
+
+#reactivate user
+@app.post("/reactivate_user/{username}")
+async def deactivate_user(username: str):
+    user_ref = db.reference(f"users/{username}")
+    user_data = user_ref.get()
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_ref.update({"disabled": False})
+    return {"message": f"User {username} reactivated successfully."}
+
+#delete user
+@app.delete("/delete_user/{username}")
+async def delete_user(username: str): 
+    user_ref = db.reference(f"users/{username}")
+    user_data = user_ref.get()
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_ref.delete()
+    return {"message": f"User {username} deleted successfully."}
+
+
+#get all users
+@app.get("/get_all_users")
+def users():
+    users_ref = db.reference("/users")
+    users_data = users_ref.get()
+    if not users_data:
+        raise HTTPException(status_code=404, detail="No users found")
+    return {"usernames": list(users_data.keys())}
+
+#get user details
+@app.get("/get_user/{username}")
+def user(username: str):
+    user_ref = db.reference(f"users/{username}")
+    user_data = user_ref.get()
+    if not user_data:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user_data
+
+
+#create backup
+@app.get("/backup")
+async def create_backup():
+    users_ref = db.reference("users")
+    users_data = users_ref.get()
+
+    outputs_ref = db.reference("output_data")
+    outputs_data = outputs_ref.get()
+
+    logs_ref = db.reference("logs")
+    logs_data = logs_ref.get()
+
+    backup_data = {
+        "users": users_data,
+        "outputs": outputs_data,
+        "logs": logs_data,
+        "timestamp": datetime.now().isoformat(),
+    }
+    backup_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_ref = db.reference(f"backups/backup_{backup_timestamp}")
+    backup_ref.set(backup_data)
+    return {"message": f"Backup created successfully: backup_{backup_timestamp}"}
+
+
+#global statistics
+@app.get("/global_statistics")
+async def global_statistics():
+    try:
+        users_ref = db.reference("users")
+        users_data = users_ref.get()
+
+        outputs_ref = db.reference("output_data")
+        outputs_data = outputs_ref.get()
+
+        logs_ref = db.reference("logs")
+        logs_data = logs_ref.get()
+
+        total_users = len(users_data) if users_data else 0
+        total_invoices = sum(len(data.get("result", [])) for data in outputs_data.values()) if outputs_data else 0
+        total_cost = sum(log.get("content", {}).get("total_cost", 0) for log in logs_data.values()) if logs_data else 0
+        return {
+            "total_users": total_users,
+            "total_invoices": total_invoices,
+            "total_cost": total_cost,            
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching global statistics: {str(e)}")
+
+
+# Get all request IDs for a user
+@app.get("/get_request_ids/{username}")
+async def get_request_ids(username: str):    
+    user_requests_ref = db.reference(f"users/{username}/request_ids")
+    request_ids = user_requests_ref.get()
+
+    if not request_ids:
+        raise HTTPException(status_code=404, detail=f"No requests found for user {username}")
+    return {"username": username, "request_ids": request_ids}
+
+
+# Fetch logs based on request ID
+@app.get("/get_logs/{request_id}")
+async def get_logs(request_id: str):
+    logs_ref = db.reference(f"logs/{request_id}")
+    log_data = logs_ref.get()
+    if not log_data:
+        raise HTTPException(status_code=404, detail=f"No logs found for request ID {request_id}")
+    return {"request_id": request_id, "log_data": log_data}
 
 
 @app.get("/")
